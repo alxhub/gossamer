@@ -1,0 +1,13 @@
+[package]
+name = "libgossamer"
+version = "0.1.0"
+authors = ["Alex Rickabaugh <alx+alxhub@alxandria.net>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-trait = "*"
+futures = "*"
+serde = { version = "*", features = ["derive"] }
+queues = "*"
