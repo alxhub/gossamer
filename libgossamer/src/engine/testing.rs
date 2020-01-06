@@ -84,6 +84,7 @@ impl TestEngine {
     &mut self,
     f: F,
   ) -> R {
+    self.sync().await;
     let (run_tx, run_rx) = channel();
     let (res_tx, res_rx) = channel();
     let wrapped_fn = move |net: &mut Network| {

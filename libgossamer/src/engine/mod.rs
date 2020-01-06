@@ -44,7 +44,29 @@ impl Network {
       /* server */ 0,
       subnet,
     );
-    res
+    if let Ok(id) = res {
+      let client = self.state.client_by_id(id);
+      let server = self.state.server_by_id(client.server);
+      let subnet = self.state.subnet_by_id(client.subnet);
+
+      self
+        .broadcast(
+          link::Message::Client(link::Client {
+            nick: client.nick.clone(),
+            ident: client.ident.clone(),
+            host: client.host.clone(),
+            gecos: client.gecos.clone(),
+            server: server.name.clone(),
+            subnet: subnet.name.clone(),
+          }),
+          None,
+        )
+        .await;
+
+      Ok(id)
+    } else {
+      res
+    }
   }
 
   pub async fn subnet_add<T: Into<String>>(&mut self, name: T) -> Result<SubnetId, state::Error> {
@@ -70,7 +92,7 @@ impl Network {
     println!("sync started from {}", self.state.server_by_id(0).name);
   }
 
-  pub async fn subnet_from_net(&mut self, msg: link::Subnet, from: ServerId) {
+  async fn subnet_from_net(&mut self, msg: link::Subnet, from: ServerId) {
     let res = self.state.subnet_add(msg.name.clone());
     match res {
       Ok(id) => {
@@ -80,6 +102,27 @@ impl Network {
       }
       Err(_) => panic!("failed to add subnet from network: {}", msg.name),
     }
+  }
+
+  async fn client_from_net(&mut self, msg: link::Client, from: ServerId) {
+    println!("client_from_net.start: {}", from);
+    let subnet = self
+      .state
+      .subnet_by_name(&msg.subnet)
+      .expect("TODO: netsplit");
+    let server = self
+      .state
+      .server_by_name(&msg.server)
+      .expect("TODO: netplit");
+    let msg_copy = msg.clone();
+    self
+      .state
+      .client_add(msg.nick, msg.ident, msg.host, msg.gecos, server, subnet)
+      .expect("TODO: netsplit");
+    self
+      .broadcast(link::Message::Client(msg_copy), Some(from))
+      .await;
+    println!("client_from_net.end");
   }
 
   async fn sync_request(&mut self, msg: link::SyncRequest, from: ServerId) {
@@ -129,6 +172,8 @@ impl Network {
     // Burst all the servers.
     link_burst_servers(&self.state, peer, link_tx).await;
     link_burst_subnets(&self.state, link_tx).await;
+    println!("bursting clients");
+    link_burst_clients(&self.state, link_tx).await;
   }
 
   async fn broadcast(&mut self, msg: link::Message, skip: Option<ServerId>) {
@@ -137,7 +182,7 @@ impl Network {
         continue;
       }
 
-      println!("broadcasting to {}", *id);
+      println!("broadcasting to {}: {:?}", *id, msg);
       link.send(link::Control::Send(msg.clone())).await.unwrap();
     }
   }
@@ -193,6 +238,30 @@ async fn link_burst_subnets(state: &State, link_tx: &mut Sender<link::Control>) 
       .await
       .unwrap();
   }
+}
+
+async fn link_burst_clients(state: &State, link_tx: &mut Sender<link::Control>) {
+  println!("burst clients start");
+  for id in state.client_iter() {
+    let client = state.client_by_id(*id);
+    let subnet = state.subnet_by_id(client.subnet);
+    let server = state.server_by_id(client.server);
+
+    println!("bursting client: {}", client.nick);
+
+    link_tx
+      .send(link::Control::Send(link::Message::Client(link::Client {
+        nick: client.nick.clone(),
+        ident: client.ident.clone(),
+        host: client.host.clone(),
+        gecos: client.gecos.clone(),
+        subnet: subnet.name.clone(),
+        server: server.name.clone(),
+      })))
+      .await
+      .unwrap();
+  }
+  println!("burst clients end");
 }
 
 pub struct EngineHandle<E: Send> {
@@ -286,11 +355,17 @@ impl<E: Send, T: Handler<E>> Engine<E, T> {
 
   async fn on_link_message(&mut self, id: ServerId, msg: link::Message) {
     println!(
-      "[{}] got incoming message",
-      self.network.state.server_by_id(0).name
+      "[{} -> {}] got incoming message: [{:?}]",
+      self.network.state.server_by_id(id).name,
+      self.network.state.server_by_id(0).name,
+      msg
     );
     match msg {
       link::Message::Subnet(subnet) => self.network.subnet_from_net(subnet, id).await,
+      link::Message::Client(client) => {
+        println!("message is a client");
+        self.network.client_from_net(client, id).await
+      }
       link::Message::SyncRequest(req) => self.network.sync_request(req, id).await,
       link::Message::SyncResponse(resp) => {
         // Check if the response is for this server.
@@ -306,6 +381,7 @@ impl<E: Send, T: Handler<E>> Engine<E, T> {
             .server_by_name(&resp.from)
             .expect("TODO: netsplit");
           self.handler.on_sync_response(&mut self.network, from).await;
+          println!("sync response handled");
         } else {
           // Forward to the target.
           self

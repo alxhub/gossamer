@@ -158,9 +158,14 @@ impl State {
     subnet.clients.insert(id);
     subnet.clients_by_lnick.insert(client.lnick.clone(), id);
     server.clients.insert(id);
+    self.clients.insert(id, client);
 
     self.next_client_id += 1;
     Ok(id)
+  }
+
+  pub fn client_iter<'a>(&'a self) -> impl Iterator<Item = &'a ClientId> + 'a {
+    self.clients.keys()
   }
 }
 

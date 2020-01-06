@@ -37,15 +37,34 @@ fn test_link() {
     async {
       a.subnet_add("test").await.unwrap();
       link_ab.start().await;
-      println!("before sync");
-      b.sync().await;
-      println!("after sync");
-      // Need to somehow await the link being established here.
       b.with(|net| {
         let linked_b = net.state.server_by_id(1);
         assert_eq!(linked_b.name, "hub.a");
         let sn_b = net.state.subnet_by_name("test");
-        assert!(sn_b.is_some(), "Subnet should exist on bx  ");
+        assert!(sn_b.is_some(), "Subnet should exist on hub.b");
+      })
+      .await;
+    }
+  });
+}
+
+#[test]
+fn test_client_link() {
+  let mut ctrl = TestController::new();
+  let mut a = ctrl.add_engine("hub.a");
+  let mut b = ctrl.add_engine("hub.b");
+  let mut link_ab = ctrl.add_link(&a, &b);
+  ctrl.run(|| {
+    async {
+      let sn = a.subnet_add("dev").await.unwrap();
+      a.client_add(sn, "test", "test", "test.client", "Test Client")
+        .await
+        .unwrap();
+      println!("client added");
+      link_ab.start().await;
+      b.with(move |net| {
+        // let client = net.state.client_by_nick(sn, "test");
+        // assert!(client.is_some(), "Client should exist on hub.b");
       })
       .await;
     }

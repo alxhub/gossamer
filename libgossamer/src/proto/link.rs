@@ -130,7 +130,9 @@ impl Link {
             println!("got: {:?}", msg);
             self.process(msg).await;
           } else {
-            panic!("remote connection has terminated!");
+            // The remote connection from the receiver has terminated.
+            // TODO: notify the control channenl about this.
+            return;
           }
         },
         msg = self.ctrl_rx.next() => {
