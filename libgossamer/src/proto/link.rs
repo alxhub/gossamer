@@ -32,6 +32,11 @@ pub struct Client {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Netsplit {
+  pub server: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SyncRequest {
   pub from: String,
 }
@@ -50,8 +55,10 @@ pub enum Message {
   Server(Server),
   SyncRequest(SyncRequest),
   SyncResponse(SyncResponse),
+  Netsplit(Netsplit),
 }
 
+#[derive(Debug)]
 pub enum Control {
   Send(Message),
   Close,
@@ -88,6 +95,10 @@ impl Link {
     }
   }
 
+  pub fn control_tx(&self) -> Sender<Control> {
+    self.ctrl_tx.clone()
+  }
+
   pub async fn process(&mut self, msg: Message) {
     match self.state {
       LinkState::Fresh => self.process_fresh(msg).await,
@@ -112,11 +123,19 @@ impl Link {
   }
 
   async fn process_control(&mut self, msg: Control) {
+    println!("link control: {:?}", msg);
     match msg {
       Control::Send(msg) => {
         println!("link sending: {:?}", msg);
         self.remote_tx.send(msg).await.unwrap();
       }
+      Control::Close => match self.state {
+        LinkState::Fresh => {}
+        LinkState::Established(id) => {
+          println!("link with {} in shutdown", id);
+          self.ctrl.link_closed(id).await;
+        }
+      },
       _ => unimplemented!(),
     }
   }
@@ -124,21 +143,27 @@ impl Link {
   pub async fn run(mut self) {
     self.ctrl.link_provisional(self.ctrl_tx.clone()).await;
     loop {
+      println!("link awaiting next message");
       select! {
         msg = self.remote_rx.next() => {
           if let Some(msg) = msg {
             println!("got: {:?}", msg);
             self.process(msg).await;
           } else {
-            // The remote connection from the receiver has terminated.
-            // TODO: notify the control channenl about this.
+            // Effectively, the remote end just hung up on us.
+            self.process_control(Control::Close).await;
+            println!("exiting link.run()");
             return;
           }
         },
         msg = self.ctrl_rx.next() => {
           if let Some(msg) = msg {
             match msg {
-              Control::Close => return,
+              Control::Close => {
+                self.process_control(msg).await;
+                println!("exiting link.run()");
+                return;
+              },
               _ => self.process_control(msg).await,
             }
           } else {
@@ -153,6 +178,7 @@ impl Link {
 #[async_trait]
 pub trait Controller {
   async fn link_provisional(&mut self, ctrl_tx: Sender<Control>);
+  async fn link_closed(&mut self, id: ServerId);
 
   async fn link_new(
     &mut self,

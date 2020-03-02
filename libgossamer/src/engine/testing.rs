@@ -4,9 +4,10 @@ use async_trait::async_trait;
 use futures::channel::mpsc;
 use futures::channel::oneshot::{channel, Receiver, Sender};
 use futures::executor::block_on;
-use futures::future::join_all;
-use futures::join;
+use futures::future::{join_all, pending};
+use futures::stream::FuturesUnordered;
 use futures::FutureExt;
+use futures::{join, pin_mut, select};
 
 pub struct TestController {
   engines: Vec<Engine<TestEvent, TestHandler>>,
@@ -22,6 +23,8 @@ struct TestLink {
   ctrl_rx: mpsc::Receiver<LinkControl>,
   a: EngineHandle<TestEvent>,
   b: EngineHandle<TestEvent>,
+  ctrl_ab: Option<mpsc::Sender<link::Control>>,
+  ctrl_ba: Option<mpsc::Sender<link::Control>>,
 }
 
 impl TestLink {
@@ -30,48 +33,66 @@ impl TestLink {
       ctrl_rx,
       a: a.handle.clone(),
       b: b.handle.clone(),
+      ctrl_ab: None,
+      ctrl_ba: None,
     }
   }
 
   async fn run(mut self) {
     println!("awaiting link startup");
-    match self.ctrl_rx.next().await.unwrap() {
-      LinkControl::Start(ready) => {
-        println!("link starting");
-
-        let (ab_tx, ab_rx) = mpsc::channel(32);
-        let (ba_tx, ba_rx) = mpsc::channel(32);
-        let (a_ready_tx, a_ready_rx) = channel();
-        let (b_ready_tx, b_ready_rx) = channel();
-
-        let (a_notify_done_tx, a_notify_done_rx) = channel();
-        let (b_notify_done_tx, b_notify_done_rx) = channel();
-
-        self
-          .a
-          .send_event(TestEvent::RequestLinkNotify(a_ready_tx, a_notify_done_tx))
-          .await;
-        self
-          .b
-          .send_event(TestEvent::RequestLinkNotify(b_ready_tx, b_notify_done_tx))
-          .await;
-
-        let (x, y) = join!(a_notify_done_rx, b_notify_done_rx);
-        x.unwrap();
-        y.unwrap();
-
-        let ready = async {
-          let (x, y) = join!(a_ready_rx, b_ready_rx);
-          x.unwrap();
-          y.unwrap();
-          ready.send(()).unwrap();
-        };
-
-        let link_ab = link::Link::new(ab_tx, ba_rx, self.a);
-        let link_ba = link::Link::new(ba_tx, ab_rx, self.b);
-        join!(link_ab.run(), link_ba.run(), ready);
+    let mut future_set = FuturesUnordered::new();
+    loop {
+      select! {
+        ctrl_msg = self.ctrl_rx.next() => {
+          match ctrl_msg {
+            Some(LinkControl::Start(ready)) => {
+              println!("link starting");
+              let (ab_tx, ab_rx) = mpsc::channel(32);
+              let (ba_tx, ba_rx) = mpsc::channel(32);
+              let (a_ready_tx, a_ready_rx) = channel();
+              let (b_ready_tx, b_ready_rx) = channel();
+              let (a_notify_done_tx, a_notify_done_rx) = channel();
+              let (b_notify_done_tx, b_notify_done_rx) = channel();
+              self
+                .a
+                .send_event(TestEvent::RequestLinkNotify(a_ready_tx, a_notify_done_tx))
+                .await;
+              self
+                .b
+                .send_event(TestEvent::RequestLinkNotify(b_ready_tx, b_notify_done_tx))
+                .await;
+              let (x, y) = join!(a_notify_done_rx, b_notify_done_rx);
+              x.unwrap();
+              y.unwrap();
+              let ready = async {
+                let (x, y) = join!(a_ready_rx, b_ready_rx);
+                x.unwrap();
+                y.unwrap();
+                ready.send(()).unwrap();
+              };
+              let link_ab = link::Link::new(ab_tx, ba_rx, self.a.clone());
+              let link_ba = link::Link::new(ba_tx, ab_rx, self.b.clone());
+              self.ctrl_ab = Some(link_ab.control_tx());
+              self.ctrl_ba = Some(link_ba.control_tx());
+              future_set.push(async {
+                join!(link_ab.run(), link_ba.run(), ready);
+              });
+            }
+            Some(LinkControl::Stop(done)) => {
+              let ctrl_ab = self.ctrl_ab.as_mut().unwrap();
+              let ctrl_ba = self.ctrl_ba.as_mut().unwrap();
+              let close_ab = ctrl_ab.send(link::Control::Close);
+              let close_ba = ctrl_ba.send(link::Control::Close);
+              join!(close_ab, close_ba);
+              done.send(()).unwrap();
+            },
+            None => unimplemented!()
+          }
+        },
+        _ = future_set.select_next_some() => {
+          return;
+        }
       }
-      _ => unimplemented!(),
     }
   }
 }
@@ -138,7 +159,7 @@ impl TestEngine {
   }
 
   pub async fn shutdown(&mut self) {
-    self.handle.shutdown().await
+    self.handle.shutdown().await;
   }
 
   async fn link_notify(&mut self, sender: Sender<()>) {
@@ -162,10 +183,19 @@ impl LinkController {
     self.ctrl_tx.send(LinkControl::Start(tx)).await.unwrap();
     rx.await.unwrap();
   }
+
+  pub async fn stop(&mut self) {
+    let (tx, rx) = channel();
+    self.ctrl_tx.send(LinkControl::Stop(tx)).await.unwrap();
+    println!("stop sent");
+    rx.await.unwrap();
+    println!("stop ack");
+  }
 }
 
 enum LinkControl {
   Start(Sender<()>),
+  Stop(Sender<()>),
 }
 
 impl TestController {
@@ -259,6 +289,11 @@ impl Handler<TestEvent> for TestHandler {
           panic!("Requested sync notificationn when another request was already active.");
         }
         let count = network.state.server_count() - 1;
+        if count == 0 {
+          // No servers to sync - short circuit!
+          tx.send(()).unwrap();
+          return;
+        }
         self.sync_notify = Some((tx, count));
         network.sync().await;
       }

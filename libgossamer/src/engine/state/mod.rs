@@ -167,12 +167,28 @@ impl State {
   pub fn client_iter<'a>(&'a self) -> impl Iterator<Item = &'a ClientId> + 'a {
     self.clients.keys()
   }
+
+  pub fn client_remove(&mut self, id: ClientId) {
+    let client = self.clients.remove(&id).unwrap();
+    let subnet = self.subnets.get_mut(&client.subnet).unwrap();
+    subnet.clients.remove(&id);
+    subnet.clients_by_lnick.remove(&client.lnick);
+
+    let server = self.servers.get_mut(&client.server).unwrap();
+    server.clients.remove(&id);
+
+    for channel in client.channels {
+      self.channel_remove_member(channel, id);
+    }
+  }
 }
 
 impl State {
   pub fn channel_by_id(&self, id: ChannelId) -> &Channel {
     self.channels.get(&id).expect("Invalid ChannelId")
   }
+
+  pub fn channel_remove_member(&mut self, id: ChannelId, member_id: ClientId) {}
 }
 
 impl State {
@@ -266,6 +282,38 @@ impl State {
 
   pub fn server_count(&self) -> usize {
     self.servers.len()
+  }
+
+  pub fn server_remove(&mut self, id: ServerId) {
+    let server = self.servers.remove(&id).unwrap();
+    if server.clients.len() > 0 {
+      panic!("cannot remove a non-empty server");
+    }
+    for link in &server.downlinks {
+      self.server_remove(*link);
+    }
+
+    if let Some(link) = server.link {
+      match self.servers.get_mut(&link.hub) {
+        Some(hub) => {
+          hub.downlinks.remove(&id);
+        }
+        None => (),
+      };
+    }
+  }
+
+  pub fn calculate_netsplit_affected_clients(&self, id: ServerId) -> HashSet<ClientId> {
+    let mut set = HashSet::new();
+    self.calculate_netsplit_affected_clients_helper(id, &mut set);
+    set
+  }
+
+  fn calculate_netsplit_affected_clients_helper(&self, id: ServerId, set: &mut HashSet<ClientId>) {
+    let server = self.servers.get(&id).unwrap();
+    for client in &server.clients {
+      set.insert(*client);
+    }
   }
 }
 

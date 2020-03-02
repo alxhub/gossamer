@@ -7,7 +7,7 @@ use futures::channel::oneshot;
 use futures::{pin_mut, Future, FutureExt, SinkExt, StreamExt};
 use queues::*;
 use state::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 
 /// `Network` is the heart and soul of a libgossamer network node, including sending messages to
@@ -176,6 +176,33 @@ impl Network {
     link_burst_clients(&self.state, link_tx).await;
   }
 
+  async fn link_split(&mut self, peer: ServerId, split_clients: HashSet<ClientId>) {
+    let server = self.state.server_by_id(peer);
+    println!(
+      "[{}] assessing split of {}",
+      self.state.server_by_id(0).name,
+      server.name
+    );
+    self.links.remove(&peer);
+    self
+      .broadcast(
+        link::Message::Netsplit(link::Netsplit {
+          server: server.lname.clone(),
+        }),
+        Some(peer),
+      )
+      .await;
+    // Resolve the impact on the network.
+    for id in split_clients {
+      println!("client {} split", self.state.client_by_id(id).nick);
+      self.state.client_remove(id);
+    }
+
+    self.state.server_remove(peer);
+
+    println!("resolved netsplit!");
+  }
+
   async fn broadcast(&mut self, msg: link::Message, skip: Option<ServerId>) {
     for (id, link) in self.links.iter_mut() {
       if Some(*id) == skip {
@@ -325,6 +352,16 @@ impl<E: Send> link::Controller for EngineHandle<E> {
       .await
       .unwrap();
   }
+
+  async fn link_closed(&mut self, id: ServerId) {
+    // Note: there's a catch-22 here, where telling the engine to Shutdown() causes it to close its
+    // links, which will in turn attempt to send LinkClosed messages to the engine via the
+    // controller reference they have. However, after Shutdown() the engine is no longer responsive
+    // to control messages. try_send() here is ensuring that in case the control channel is closed,
+    // no crash happens.
+    // TODO: think of a better way to handle this case.
+    self.ctrl_tx.try_send(EngineControlMsg::LinkClosed(id));
+  }
 }
 
 /// `Engine` is the driving half of the Network+Engine combo. It listens to messages from other
@@ -351,6 +388,12 @@ impl<E: Send, T: Handler<E>> Engine<E, T> {
 
   pub fn handle(&self) -> EngineHandle<E> {
     self._handle.clone()
+  }
+
+  async fn on_link_split(&mut self, id: ServerId) {
+    println!("got link split message");
+    let split_clients = self.network.state.calculate_netsplit_affected_clients(id);
+    self.network.link_split(id, split_clients).await;
   }
 
   async fn on_link_message(&mut self, id: ServerId, msg: link::Message) {
@@ -414,11 +457,15 @@ impl<E: Send, T: Handler<E>> Engine<E, T> {
           }
           res_tx.send(res).unwrap();
         }
+        EngineControlMsg::LinkClosed(id) => {
+          self.on_link_split(id).await;
+        }
         EngineControlMsg::LinkMessage(id, msg) => self.on_link_message(id, msg).await,
         EngineControlMsg::Event(e) => {
           self.handler.on_event(&mut self.network, e).await;
         }
         EngineControlMsg::Shutdown() => {
+          println!("shut down of {}", self.network.state.server_by_id(0).name);
           // panic!("Shutting down {}", self.network.state.server_by_id(0).name);
           for (_, v) in self.network.links.iter_mut() {
             v.send(link::Control::Close).await.unwrap();
@@ -449,6 +496,7 @@ enum EngineControlMsg<E> {
     oneshot::Sender<Result<ServerId, state::Error>>,
   ),
   LinkMessage(ServerId, link::Message),
+  LinkClosed(ServerId),
   Event(E),
   Shutdown(),
 }
