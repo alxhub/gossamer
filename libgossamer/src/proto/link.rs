@@ -123,16 +123,13 @@ impl Link {
   }
 
   async fn process_control(&mut self, msg: Control) {
-    println!("link control: {:?}", msg);
     match msg {
       Control::Send(msg) => {
-        println!("link sending: {:?}", msg);
         self.remote_tx.send(msg).await.unwrap();
       }
       Control::Close => match self.state {
         LinkState::Fresh => {}
         LinkState::Established(id) => {
-          println!("link with {} in shutdown", id);
           self.ctrl.link_closed(id).await;
         }
       },
@@ -143,16 +140,13 @@ impl Link {
   pub async fn run(mut self) {
     self.ctrl.link_provisional(self.ctrl_tx.clone()).await;
     loop {
-      println!("link awaiting next message");
       select! {
         msg = self.remote_rx.next() => {
           if let Some(msg) = msg {
-            println!("got: {:?}", msg);
             self.process(msg).await;
           } else {
             // Effectively, the remote end just hung up on us.
             self.process_control(Control::Close).await;
-            println!("exiting link.run()");
             return;
           }
         },
@@ -161,7 +155,6 @@ impl Link {
             match msg {
               Control::Close => {
                 self.process_control(msg).await;
-                println!("exiting link.run()");
                 return;
               },
               _ => self.process_control(msg).await,

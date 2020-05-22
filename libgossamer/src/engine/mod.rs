@@ -49,19 +49,15 @@ impl Network {
       let server = self.state.server_by_id(client.server);
       let subnet = self.state.subnet_by_id(client.subnet);
 
-      self
-        .broadcast(
-          link::Message::Client(link::Client {
-            nick: client.nick.clone(),
-            ident: client.ident.clone(),
-            host: client.host.clone(),
-            gecos: client.gecos.clone(),
-            server: server.name.clone(),
-            subnet: subnet.name.clone(),
-          }),
-          None,
-        )
-        .await;
+      let msg = link::Message::Client(link::Client {
+        nick: client.nick.clone(),
+        ident: client.ident.clone(),
+        host: client.host.clone(),
+        gecos: client.gecos.clone(),
+        server: server.name.clone(),
+        subnet: subnet.name.clone(),
+      });
+      self.broadcast(msg, None).await;
 
       Ok(id)
     } else {
@@ -89,13 +85,12 @@ impl Network {
         None,
       )
       .await;
-    println!("sync started from {}", self.state.server_by_id(0).name);
   }
 
   async fn subnet_from_net(&mut self, msg: link::Subnet, from: ServerId) {
     let res = self.state.subnet_add(msg.name.clone());
     match res {
-      Ok(id) => {
+      Ok(_) => {
         self
           .broadcast(link::Message::Subnet(msg.clone()), Some(from))
           .await;
@@ -105,7 +100,6 @@ impl Network {
   }
 
   async fn client_from_net(&mut self, msg: link::Client, from: ServerId) {
-    println!("client_from_net.start: {}", from);
     let subnet = self
       .state
       .subnet_by_name(&msg.subnet)
@@ -122,15 +116,48 @@ impl Network {
     self
       .broadcast(link::Message::Client(msg_copy), Some(from))
       .await;
-    println!("client_from_net.end");
+  }
+
+  async fn server_from_net(&mut self, msg: link::Server, from: ServerId) {
+    let msg_copy = msg.clone();
+    let hub = self
+      .state
+      .server_by_name(&msg.hub_lname)
+      .expect("TODO: netsplit, unable to find hub of incoming server");
+    let res = self.state.server_add(msg.name, hub);
+    if let Ok(_) = res {
+      self
+        .broadcast(link::Message::Server(msg_copy), Some(from))
+        .await;
+    } else {
+      panic!(
+        "Failed to add server {} (hub {})",
+        msg_copy.name, msg_copy.hub_lname
+      );
+    }
+  }
+
+  async fn netsplit_from_net(&mut self, msg: link::Netsplit, from: ServerId) {
+    let msg_copy = msg.clone();
+
+    let peer = self
+      .state
+      .server_by_name(&msg.server)
+      .expect("Unknown netsplit server");
+
+    let split_clients = self.state.calculate_netsplit_affected_clients(peer);
+    for id in split_clients {
+      self.state.client_remove(id);
+    }
+
+    self.state.server_remove(peer);
+
+    self
+      .broadcast(link::Message::Netsplit(msg_copy), Some(from))
+      .await;
   }
 
   async fn sync_request(&mut self, msg: link::SyncRequest, from: ServerId) {
-    println!(
-      "got sync request at {} from {}",
-      self.state.server_by_id(0).name,
-      msg.from
-    );
     self
       .broadcast(link::Message::SyncRequest(msg.clone()), Some(from))
       .await;
@@ -150,19 +177,20 @@ impl Network {
     name: String,
     link_tx: Sender<link::Control>,
   ) -> Result<ServerId, state::Error> {
-    let res = self.state.server_add(name, 0);
-    let id = match res {
-      Ok(id) => id,
-      Err(err) => return Err(err),
-    };
+    let id = self.state.server_add(name.clone(), 0)?;
+
+    self
+      .broadcast(
+        link::Message::Server(link::Server {
+          name,
+          hub_lname: self.state.server_by_id(0).lname.clone(),
+        }),
+        Some(id),
+      )
+      .await;
+
     self.links.insert(id, link_tx);
     self.link_burst(id).await;
-
-    println!(
-      "link: {} <-> {}",
-      self.state.server_by_id(0).name,
-      self.state.server_by_id(id).name
-    );
 
     Ok(id)
   }
@@ -172,35 +200,27 @@ impl Network {
     // Burst all the servers.
     link_burst_servers(&self.state, peer, link_tx).await;
     link_burst_subnets(&self.state, link_tx).await;
-    println!("bursting clients");
     link_burst_clients(&self.state, link_tx).await;
   }
 
   async fn link_split(&mut self, peer: ServerId, split_clients: HashSet<ClientId>) {
     let server = self.state.server_by_id(peer);
-    println!(
-      "[{}] assessing split of {}",
-      self.state.server_by_id(0).name,
-      server.name
-    );
+    let server_lname = server.lname.clone();
     self.links.remove(&peer);
     self
       .broadcast(
         link::Message::Netsplit(link::Netsplit {
-          server: server.lname.clone(),
+          server: server_lname,
         }),
         Some(peer),
       )
       .await;
     // Resolve the impact on the network.
     for id in split_clients {
-      println!("client {} split", self.state.client_by_id(id).nick);
       self.state.client_remove(id);
     }
 
     self.state.server_remove(peer);
-
-    println!("resolved netsplit!");
   }
 
   async fn broadcast(&mut self, msg: link::Message, skip: Option<ServerId>) {
@@ -209,7 +229,6 @@ impl Network {
         continue;
       }
 
-      println!("broadcasting to {}: {:?}", *id, msg);
       link.send(link::Control::Send(msg.clone())).await.unwrap();
     }
   }
@@ -268,13 +287,10 @@ async fn link_burst_subnets(state: &State, link_tx: &mut Sender<link::Control>) 
 }
 
 async fn link_burst_clients(state: &State, link_tx: &mut Sender<link::Control>) {
-  println!("burst clients start");
   for id in state.client_iter() {
     let client = state.client_by_id(*id);
     let subnet = state.subnet_by_id(client.subnet);
     let server = state.server_by_id(client.server);
-
-    println!("bursting client: {}", client.nick);
 
     link_tx
       .send(link::Control::Send(link::Message::Client(link::Client {
@@ -288,7 +304,6 @@ async fn link_burst_clients(state: &State, link_tx: &mut Sender<link::Control>) 
       .await
       .unwrap();
   }
-  println!("burst clients end");
 }
 
 pub struct EngineHandle<E: Send> {
@@ -391,32 +406,45 @@ impl<E: Send, T: Handler<E>> Engine<E, T> {
   }
 
   async fn on_link_split(&mut self, id: ServerId) {
-    println!("got link split message");
     let split_clients = self.network.state.calculate_netsplit_affected_clients(id);
+    self.handler.on_netsplit(&mut self.network, id, 0);
     self.network.link_split(id, split_clients).await;
   }
 
   async fn on_link_message(&mut self, id: ServerId, msg: link::Message) {
-    println!(
-      "[{} -> {}] got incoming message: [{:?}]",
-      self.network.state.server_by_id(id).name,
-      self.network.state.server_by_id(0).name,
-      msg
-    );
     match msg {
       link::Message::Subnet(subnet) => self.network.subnet_from_net(subnet, id).await,
-      link::Message::Client(client) => {
-        println!("message is a client");
-        self.network.client_from_net(client, id).await
+      link::Message::Client(client) => self.network.client_from_net(client, id).await,
+      link::Message::Netsplit(netsplit) => {
+        let split = self
+          .network
+          .state
+          .server_by_name(&netsplit.server)
+          .expect("Cannot find netsplit server?");
+        let split_from = self
+          .network
+          .state
+          .server_by_id(split)
+          .link
+          .map(|link| link.hub)
+          .expect("Cannot find hub of split server");
+        // TODO: think about the timing here. Maybe this should happen after netsplit_from_net, so
+        // the handler observes the post-split network.
+        self
+          .handler
+          .on_netsplit(&mut self.network, split, split_from)
+          .await;
+        self.network.netsplit_from_net(netsplit, id).await
       }
+      link::Message::Server(server) => self.network.server_from_net(server, id).await,
       link::Message::SyncRequest(req) => self.network.sync_request(req, id).await,
       link::Message::SyncResponse(resp) => {
         // Check if the response is for this server.
-        let target = self
-          .network
-          .state
-          .server_by_name(&resp.to)
-          .expect("TODO: netsplit");
+        let target = self.network.state.server_by_name(&resp.to).expect(&format!(
+          "TODO: netsplit (syncresponse target not found): {} @ {}",
+          resp.to,
+          self.network.state.server_by_id(0).name
+        ));
         if target == 0 {
           let from = self
             .network
@@ -424,7 +452,6 @@ impl<E: Send, T: Handler<E>> Engine<E, T> {
             .server_by_name(&resp.from)
             .expect("TODO: netsplit");
           self.handler.on_sync_response(&mut self.network, from).await;
-          println!("sync response handled");
         } else {
           // Forward to the target.
           self
@@ -465,7 +492,6 @@ impl<E: Send, T: Handler<E>> Engine<E, T> {
           self.handler.on_event(&mut self.network, e).await;
         }
         EngineControlMsg::Shutdown() => {
-          println!("shut down of {}", self.network.state.server_by_id(0).name);
           // panic!("Shutting down {}", self.network.state.server_by_id(0).name);
           for (_, v) in self.network.links.iter_mut() {
             v.send(link::Control::Close).await.unwrap();
@@ -486,6 +512,7 @@ pub trait Handler<E> {
   async fn on_event(&mut self, network: &mut Network, event: E);
   async fn on_link(&mut self, network: &mut Network, peer: ServerId);
   async fn on_sync_response(&mut self, network: &mut Network, server: ServerId);
+  async fn on_netsplit(&mut self, network: &mut Network, split: ServerId, from: ServerId);
 }
 
 enum EngineControlMsg<E> {

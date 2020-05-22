@@ -39,14 +39,12 @@ impl TestLink {
   }
 
   async fn run(mut self) {
-    println!("awaiting link startup");
     let mut future_set = FuturesUnordered::new();
     loop {
       select! {
         ctrl_msg = self.ctrl_rx.next() => {
           match ctrl_msg {
             Some(LinkControl::Start(ready)) => {
-              println!("link starting");
               let (ab_tx, ab_rx) = mpsc::channel(32);
               let (ba_tx, ba_rx) = mpsc::channel(32);
               let (a_ready_tx, a_ready_rx) = channel();
@@ -112,6 +110,7 @@ impl TestEngine {
       let res = f(net);
       res_tx.send(res).unwrap();
     };
+
     self
       .handle
       .send_event(TestEvent::Run(Box::new(wrapped_fn), run_tx))
@@ -187,9 +186,7 @@ impl LinkController {
   pub async fn stop(&mut self) {
     let (tx, rx) = channel();
     self.ctrl_tx.send(LinkControl::Stop(tx)).await.unwrap();
-    println!("stop sent");
     rx.await.unwrap();
-    println!("stop ack");
   }
 }
 
@@ -257,11 +254,35 @@ struct TestHandler {
   sync_notify: Option<(Sender<()>, usize)>,
 }
 
+impl TestHandler {
+  fn on_synced_with_server_count(&mut self, num_synced: usize) {
+    let mut sync_notify = None;
+    std::mem::swap(&mut self.sync_notify, &mut sync_notify);
+    if let Some((tx, count)) = sync_notify {
+      let count = count - num_synced;
+      if count == 0 {
+        // All connected servers have responded.
+        tx.send(()).unwrap();
+      } else {
+        // Still waiting on `count` servers.
+        self.sync_notify = Some((tx, count));
+      }
+    }
+  }
+
+  fn deep_count_servers(&self, network: &Network, id: ServerId) -> usize {
+    let mut count: usize = 1;
+    let server = network.state.server_by_id(id);
+    for downlink in &server.downlinks {
+      count += self.deep_count_servers(network, *downlink);
+    }
+    count
+  }
+}
+
 #[async_trait]
 impl Handler<TestEvent> for TestHandler {
-  async fn on_startup(&mut self, network: &mut Network) {
-    println!("handler startup");
-  }
+  async fn on_startup(&mut self, network: &mut Network) {}
 
   async fn on_event(&mut self, network: &mut Network, event: TestEvent) {
     match event {
@@ -315,18 +336,12 @@ impl Handler<TestEvent> for TestHandler {
   }
 
   async fn on_sync_response(&mut self, network: &mut Network, server: ServerId) {
-    let mut sync_notify = None;
-    std::mem::swap(&mut self.sync_notify, &mut sync_notify);
-    if let Some((tx, count)) = sync_notify {
-      let count = count - 1;
-      if count == 0 {
-        // All connected servers have responded.
-        tx.send(()).unwrap();
-      } else {
-        // Still waiting on `count` servers.
-        self.sync_notify = Some((tx, count));
-      }
-    }
+    self.on_synced_with_server_count(1);
+  }
+
+  async fn on_netsplit(&mut self, network: &mut Network, peer: ServerId, from: ServerId) {
+    let count = self.deep_count_servers(network, peer);
+    self.on_synced_with_server_count(count);
   }
 }
 

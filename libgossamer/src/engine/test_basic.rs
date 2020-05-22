@@ -102,3 +102,48 @@ fn test_netsplit() {
     .await;
   });
 }
+
+#[test]
+fn test_netsplit_distant_client() {
+  let mut ctrl = TestController::new();
+  let mut a = ctrl.add_engine("hub.a");
+  let mut b = ctrl.add_engine("hub.b");
+  let mut c = ctrl.add_engine("hub.c");
+  let mut d = ctrl.add_engine("hub.d");
+  let mut link_ab = ctrl.add_link(&a, &b);
+  let mut link_bc = ctrl.add_link(&b, &c);
+  let mut link_cd = ctrl.add_link(&c, &d);
+  ctrl.run(|| async {
+    let sn = a.subnet_add("dev").await.unwrap();
+    a.client_add(sn, "test", "test", "test.client", "Test Client")
+      .await
+      .unwrap();
+    link_ab.start().await;
+    link_bc.start().await;
+    link_cd.start().await;
+
+    d.with(move |net| {
+      let client = net.state.client_by_nick(sn, "test");
+      assert!(client.is_some(), "Client should exist on hub.d");
+    })
+    .await;
+
+    link_cd.stop().await;
+
+    b.with(move |net| {
+      let client = net.state.client_by_nick(sn, "test");
+      assert!(client.is_some(), "Client should exist on hub.b");
+    })
+    .await;
+    c.with(move |net| {
+      let client = net.state.client_by_nick(sn, "test");
+      assert!(client.is_some(), "Client should exist on hub.c");
+    })
+    .await;
+    d.with(move |net| {
+      let client = net.state.client_by_nick(sn, "test");
+      assert!(client.is_none(), "Client should not exist on hub.d");
+    })
+    .await;
+  });
+}

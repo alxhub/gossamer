@@ -314,6 +314,9 @@ impl State {
     for client in &server.clients {
       set.insert(*client);
     }
+    for other in server.downlinks.iter() {
+      self.calculate_netsplit_affected_clients_helper(*other, set);
+    }
   }
 }
 
