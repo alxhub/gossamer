@@ -9,5 +9,5 @@ edition = "2018"
 [dependencies]
 async-trait = "*"
 libgossamer = { path = "../libgossamer" }
-tokio = { version = "*", features = ["macros", "net", "rt-core"] }
+tokio = { version = "*", features = ["macros", "net", "rt-core", "sync"] }
 futures = "*"

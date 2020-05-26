@@ -3,6 +3,8 @@ use libgossamer::engine::state::ServerId;
 use libgossamer::engine::{Engine, EngineHandle, Handler, Network};
 use tokio::prelude::*;
 
+mod proto;
+
 struct IrcdEvent {}
 
 struct Ircd {}
