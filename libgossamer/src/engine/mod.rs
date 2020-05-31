@@ -326,6 +326,13 @@ impl<E: Send> EngineHandle<E> {
       .await
       .unwrap();
   }
+
+  pub fn send_event_sync(&mut self, event: E) {
+    self
+      .ctrl_tx
+      .try_send(EngineControlMsg::Event(event))
+      .unwrap();
+  }
 }
 
 impl<E: Send> Clone for EngineHandle<E> {

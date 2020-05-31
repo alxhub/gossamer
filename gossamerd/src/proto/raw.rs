@@ -1,4 +1,5 @@
 use super::buffer::Buffer;
+use std::fmt;
 
 const SMALL_SIZE: usize = 6;
 
@@ -124,6 +125,12 @@ impl RawMessage {
       args,
       cmd_index,
     }
+  }
+}
+
+impl fmt::Debug for RawMessage {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_fmt(format_args!("Buffer({})", self.buffer.as_str()))
   }
 }
 
