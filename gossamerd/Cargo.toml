@@ -12,3 +12,4 @@ libgossamer = { path = "../libgossamer" }
 tokio = { version = "*", features = ["macros", "stream", "net", "rt-core", "sync", "io-util", "tcp"] }
 tokio-util = { version = "*", features = ["codec"] }
 futures = "*"
+take_mut = "*"

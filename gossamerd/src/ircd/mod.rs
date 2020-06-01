@@ -10,6 +10,8 @@ use libgossamer::engine::{EngineHandle, Handler, Network};
 use listener::Listener;
 use std::collections::HashMap;
 
+mod welcome;
+
 #[derive(Debug)]
 pub enum IrcdEvent {
   AttemptRegistration {
@@ -19,6 +21,7 @@ pub enum IrcdEvent {
     tx: mpsc::Sender<ClientEvent>,
   },
   ClientMessage(ClientId, IrcMessage),
+  ClientDisconnect(ClientId),
 }
 
 pub struct Ircd {
@@ -43,6 +46,10 @@ impl Ircd {
       }
       _ => unimplemented!(),
     }
+  }
+
+  async fn on_client_disconnect(&mut self, network: &mut Network, id: ClientId) {
+    network.client_quit(id, "Quit".to_string()).await;
   }
 
   async fn on_privmsg(&mut self, network: &mut Network, id: ClientId, msg: IrcPrivateMessage) {
@@ -92,9 +99,7 @@ impl Handler<IrcdEvent> for Ircd {
           Ok(id) => {
             self.local_client.insert(id, tx.clone());
             tx.send(ClientEvent::RegistrationSuccess(id)).await.unwrap();
-            tx.send(ClientEvent::Send("Hello there!\r\n".to_string()))
-              .await
-              .unwrap();
+            self.send_welcome(network, id, tx).await.unwrap();
           }
           Err(state::Error::NickAlreadyInUse(_)) => {
             tx.send(ClientEvent::RegistrationNickTaken).await.unwrap();
@@ -103,6 +108,7 @@ impl Handler<IrcdEvent> for Ircd {
         };
       }
       IrcdEvent::ClientMessage(id, msg) => self.on_client_message(network, id, msg).await,
+      IrcdEvent::ClientDisconnect(id) => self.on_client_disconnect(network, id).await,
     }
   }
 

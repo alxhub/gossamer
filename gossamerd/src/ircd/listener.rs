@@ -52,7 +52,7 @@ async fn listen_task(
       socket = listener.accept() => {
         let (socket, _) = socket.unwrap();
         let (conn_read, conn_write) = socket.into_split();
-        tokio::spawn(ClientConnection::new("hub.a", handle.clone()).run(conn_read, conn_write));
+        tokio::spawn(ClientConnection::new("hub.a".to_string(), handle.clone()).run(conn_read, conn_write));
       }
     }
   }

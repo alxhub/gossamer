@@ -76,6 +76,15 @@ impl Network {
     res
   }
 
+  pub async fn client_quit(&mut self, id: ClientId, reason: String) {
+    println!(
+      "Client {} quit: {}",
+      self.state.client_by_id(id).nick,
+      reason
+    );
+    self.state.client_remove(id);
+  }
+
   pub async fn sync(&mut self) {
     self
       .broadcast(

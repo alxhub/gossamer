@@ -6,6 +6,7 @@ use futures::stream::{Stream, StreamExt};
 use libgossamer::engine::state::ClientId;
 use libgossamer::engine::EngineHandle;
 use std::io::Write;
+use take_mut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::select;
 
@@ -32,7 +33,7 @@ pub trait ClientDriver {
 
 pub struct ClientConnection {
   state: ClientState,
-
+  server_name: String,
   ircd_tx: EngineHandle<IrcdEvent>,
 
   event_rx: Option<mpsc::Receiver<ClientEvent>>,
@@ -56,7 +57,7 @@ struct PendingClientState {
 }
 
 impl ClientConnection {
-  pub fn new(server_name: &'_ str, ircd_tx: EngineHandle<IrcdEvent>) -> ClientConnection {
+  pub fn new(server_name: String, ircd_tx: EngineHandle<IrcdEvent>) -> ClientConnection {
     let mut sendq_buffer: Box<[u8]> = Box::new([0u8; 4096]);
     let notice = format!(
       ":{} NOTICE * :*** Looking up your hostname...\r\n:{} NOTICE * :*** Found your hostname\r\n",
@@ -68,6 +69,7 @@ impl ClientConnection {
 
     ClientConnection {
       state: ClientState::Pending(Default::default()),
+      server_name,
       ircd_tx,
       event_rx: Some(event_rx),
       event_tx,
@@ -93,9 +95,21 @@ impl ClientConnection {
           self.sendq_buffer.copy_within(n..self.sendq_pos, 0);
           self.sendq_pos -= n;
         }
-        res = conn_read.read(&mut read_buf), if !self.state.is_buffering() => {
-          let n = res.unwrap();
-          self.process_bytes(&read_buf[0..n], &mut codec).await;
+        res = conn_read.read(&mut read_buf), if self.state.should_read() => {
+          match res {
+            Ok(n) => {
+              if n > 0 {
+                self.process_bytes(&read_buf[0..n], &mut codec).await;
+              } else {
+                self.process_disconnect(None).await;
+                return;
+              }
+            }
+            Err(err) => {
+              self.process_disconnect(Some(err)).await;
+              return;
+            }
+          }
         }
         ev = event_rx.next() => {
           let ev = ev.unwrap();
@@ -104,14 +118,16 @@ impl ClientConnection {
               self.state = ClientState::Active(id);
             }
             ClientEvent::RegistrationNickTaken => {
-              panic!("nick taken");
+              if let ClientState::RegistrationInProgress(reg) = self.state {
+                let msg = format!(":{} 433 {} :Nickname is already in use\r\n", self.server_name, reg.nick.as_ref().unwrap());
+                self.state = ClientState::Pending(reg);
+                self.write_sendq(msg.as_ref());
+              } else {
+                unreachable!();
+              }
             }
             ClientEvent::Send(msg) => {
-              if self.sendq_buffer.len() - self.sendq_pos >= msg.len() {
-                self.sendq_pos += self.sendq_buffer.as_mut().write(msg.as_ref()).unwrap();
-              } else {
-                panic!("sendq exceeded");
-              }
+              self.write_sendq(msg.as_ref());
             },
           }
         }
@@ -119,9 +135,17 @@ impl ClientConnection {
     }
   }
 
+  fn write_sendq(&mut self, msg: &[u8]) {
+    if self.sendq_buffer.len() - self.sendq_pos >= msg.len() {
+      self.sendq_pos += self.sendq_buffer.as_mut().write(msg.as_ref()).unwrap();
+    } else {
+      panic!("sendq exceeded");
+    }
+  }
+
   async fn process_bytes(&mut self, bytes: &[u8], codec: &mut LineCodec) {
     let lines = codec.add_bytes(bytes);
-    if self.state.is_buffering() {
+    if !self.state.should_read() {
       return;
     }
 
@@ -129,9 +153,22 @@ impl ClientConnection {
       let msg = IrcMessage::from(line).unwrap();
       self.process_message(msg).await;
 
-      if self.state.is_buffering() {
+      if !self.state.should_read() {
         return;
       }
+    }
+  }
+
+  async fn process_disconnect(&mut self, err: Option<std::io::Error>) {
+    match self.state {
+      ClientState::Active(id) => {
+        self
+          .ircd_tx
+          .send_event(IrcdEvent::ClientDisconnect(id))
+          .await;
+      }
+      ClientState::Pending(_) => (),
+      _ => unreachable!(),
     }
   }
 
@@ -150,12 +187,21 @@ impl ClientConnection {
         };
         // Register if possible.
         if reg.nick.is_some() && reg.ident.is_some() && reg.gecos.is_some() {
+          let nick = reg.nick.clone().unwrap();
+          let ident = reg.ident.clone().unwrap();
+          let gecos = reg.gecos.clone().unwrap();
+
+          take_mut::take(&mut self.state, |state| match state {
+            ClientState::Pending(reg) => ClientState::RegistrationInProgress(reg),
+            _ => unreachable!(),
+          });
+
           self
             .ircd_tx
             .send_event(IrcdEvent::AttemptRegistration {
-              nick: reg.nick.clone().unwrap(),
-              ident: reg.ident.clone().unwrap(),
-              gecos: reg.gecos.clone().unwrap(),
+              nick,
+              ident,
+              gecos,
               tx: self.event_tx.clone(),
             })
             .await;
@@ -174,10 +220,10 @@ impl ClientConnection {
 }
 
 impl ClientState {
-  fn is_buffering(&self) -> bool {
+  fn should_read(&self) -> bool {
     match self {
-      ClientState::RegistrationInProgress(_) => true,
-      _ => false,
+      ClientState::RegistrationInProgress(_) => false,
+      _ => true,
     }
   }
 }
