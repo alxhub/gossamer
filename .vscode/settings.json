@@ -1,0 +1,4 @@
+{
+  "editor.formatOnSave": true,
+  "rust.rustfmt_path": "$HOME/.cargo/bin/rustfmt"
+}
